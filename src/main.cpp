@@ -1,59 +1,42 @@
 #include <iostream>
-#include <ranges>
+#include <sstream>
 #include <string>
 #include <variant>
 #include <vector>
-#include <sstream> // Added for std::istringstream
 
 namespace REPL {
+
 struct ReadContinueCode {
   std::vector<std::string> args;
 };
 
-struct ReadStopCode {
-  std::string reason;
-};
+struct ReadExitCode {};
 
-struct ReadExitCode {
-  std::string reason;
-};
-
-using ReadReturnCode =
-    std::variant<ReadContinueCode, ReadStopCode, ReadExitCode>;
+using ReadReturnCode = std::variant<ReadContinueCode, ReadExitCode>;
 
 ReadReturnCode read() {
-  std::cout << "$ ";
+  while (true) {
+    std::cout << "$ ";
 
-  std::string input;
+    std::string input;
+    if (!std::getline(std::cin, input)) {
+      return ReadExitCode{};
+    }
 
-  // TODO: handle EOF (Ctrl+D), input errors, and other edge cases
-  if (!std::getline(std::cin, input)) {
-    ReadStopCode stopCode{"input error"};
-    return stopCode;
+    std::istringstream iss(input);
+    std::vector<std::string> args;
+    std::string token;
+    while (iss >> token) {
+      args.push_back(token);
+    }
+
+    if (!args.empty()) {
+      return ReadContinueCode{std::move(args)};
+    }
   }
-
-  if (input == "exit") {
-    ReadExitCode exitCode{"user requested exit"};
-    return exitCode;
-  }
-  std::istringstream iss(input);
-  std::vector<std::string> args;
-  std::string token;
-
-  while (iss >> token) {   // automatically splits on whitespace
-    args.push_back(token);
-  }
-
-  if (args.empty()) {
-    return ReadStopCode{"empty input"};  // or handle however you prefer
-  }
-
-  return ReadContinueCode{args};
 }
 
-
-// use structs to enforce type safety and make it easier to add more commands in the future
-struct UnkownCommandT {
+struct UnknownCommandT {
   std::string reason;
 };
 
@@ -61,87 +44,70 @@ struct EchoReturnT {
   std::string output;
 };
 
-using EvaluateReturnT = std::variant<UnkownCommandT, EchoReturnT>;
-EvaluateReturnT evaluate(const std::vector<std::string>& args) {
-  // assert args is not empty
-  std::string input = args[0];
+struct ExitCommandT {
+};
 
-  if (input == "echo") {
-    std::string output;
-    for (size_t i = 1; i < args.size(); ++i) {
-        if (i > 1) {
-            output += " ";
-        }
-        output += args[i];
-    }
-    return EchoReturnT{output};
+using EvaluateReturnT =
+    std::variant<UnknownCommandT, EchoReturnT, ExitCommandT>;
+
+EvaluateReturnT evaluate(const std::vector<std::string> &args) {
+  const std::string &cmd = args[0];
+
+  if (cmd == "exit") {
+    return ExitCommandT{};
   }
 
-  std::string reason = input + ": command not found";
-  return UnkownCommandT{reason};
+  if (cmd == "echo") {
+    std::string output;
+    for (size_t i = 1; i < args.size(); ++i) {
+      if (i > 1)
+        output += ' ';
+      output += args[i];
+    }
+    return EchoReturnT{std::move(output)};
+  }
+
+  return UnknownCommandT{cmd + ": command not found"};
 }
 
-void print(const EvaluateReturnT& result) {
+void print(const EvaluateReturnT &result) {
   std::visit(
-    [](auto &&state) {
-      using T = std::decay_t<decltype(state)>;
-
-      if constexpr (std::is_same_v<T, REPL::UnkownCommandT>) {
-        std::cout << state.reason << "\n";
-      } else if constexpr (std::is_same_v<T, REPL::EchoReturnT>) {
-        std::cout << state.output << "\n";
-      }
-    }, result);
+      [](auto &&state) {
+        using T = std::decay_t<decltype(state)>;
+        if constexpr (std::is_same_v<T, UnknownCommandT>) {
+          std::cout << state.reason << '\n';
+        } else if constexpr (std::is_same_v<T, EchoReturnT>) {
+          std::cout << state.output << '\n';
+        }
+      },
+      result);
 }
 
 } // namespace REPL
 
 int main() {
-  // configure std::cout global instance to flush after every std::cout /
-  // std:cerr
   std::cout << std::unitbuf;
   std::cerr << std::unitbuf;
 
   while (true) {
-    // +++++++++++++
-    // READ
-    // +++++++++++++
+    // read
     auto readResult = REPL::read();
 
-    std::vector<std::string> args;
-    bool exit = false;
-    std::string exitReason;
-    std::visit(
-        [&args, &exit, &exitReason](auto &&state) {
-          using T = std::decay_t<decltype(state)>;
-
-          if constexpr (std::is_same_v<T, REPL::ReadContinueCode>) {
-            args = state.args;
-          } else if constexpr (std::is_same_v<T, REPL::ReadStopCode>) {
-            // TODO: print error message to stderr
-            exit = true;
-            exitReason = state.reason;
-            
-          } else if constexpr (std::is_same_v<T, REPL::ReadExitCode>) {
-            exit = true;
-            exitReason = state.reason;
-          }
-        },
-        readResult);
-
-    if (exit) {
-      // TODO: print exit reason to stderr
+    if (std::holds_alternative<REPL::ReadExitCode>(readResult))
+      // check whether to exit
       break;
-    }
 
-    // +++++++++++++
-    // EVALUATE
-    // +++++++++++++
+    auto &args = std::get<REPL::ReadContinueCode>(readResult).args; // grab args
+    
+    // evaulate args
     auto evalResult = REPL::evaluate(args);
 
-    // +++++++++++++
-    // PRINT
-    // +++++++++++++
-    print(evalResult);
+    if (std::holds_alternative<REPL::ExitCommandT>(evalResult))
+      break;
+
+    // print result from evaluation
+    REPL::print(evalResult);
   }
+
+  return 0;
 }

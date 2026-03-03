@@ -1045,3 +1045,8 @@ dkms.conf
 *.dis
 
 vcpkg_installed
+
+##### Project-specific
+CLAUDE.md
+github
+github.pub
