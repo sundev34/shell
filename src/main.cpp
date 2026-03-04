@@ -1,10 +1,13 @@
-#include <algorithm>
-#include <array>
 #include <iostream>
+#include <memory>
+#include <span>
 #include <sstream>
 #include <string>
+#include <unordered_map>
 #include <variant>
 #include <vector>
+#include <cstdlib>
+#include <filesystem>
 
 namespace REPL {
 
@@ -39,83 +42,120 @@ ReadReturnCode read() {
   }
 }
 
-struct UnknownCommandT {
-  std::string reason;
+class ICommand {
+public:
+  virtual ~ICommand() = default;
+  virtual std::string_view name() const = 0;
+  virtual bool isBuiltin() const = 0;
+  // Returns false to signal the shell should exit.
+  virtual bool execute(std::span<const std::string> args) = 0;
 };
 
-struct ExitCommandT {
-  static constexpr std::string_view name = "exit";
-};
-
-struct EchoCommandT {
-  static constexpr std::string_view name = "echo";
-  std::string output;
-};
-
-struct TypeCommandT {
-  static constexpr std::string_view name = "type";
-  std::string output;
-};
-
-using EvaluateReturnT =
-    std::variant<UnknownCommandT, ExitCommandT, EchoCommandT, TypeCommandT>;
-
-constexpr std::array BUILTIN_NAMES = {
-    ExitCommandT::name,
-    EchoCommandT::name,
-    TypeCommandT::name,
-};
-
-EvaluateReturnT evaluate(const std::vector<std::string> &args) {
-  const std::string &cmd = args[0];
-
-  if (cmd == ExitCommandT::name) {
-    return ExitCommandT{};
+class CommandRegistry {
+public:
+  void registerCommand(std::unique_ptr<ICommand> cmd) {
+    commands_[std::string(cmd->name())] = std::move(cmd);
   }
 
-  if (cmd == EchoCommandT::name) {
-    std::string output;
+  ICommand *find(std::string_view name) const {
+    auto it = commands_.find(std::string(name));
+    return it != commands_.end() ? it->second.get() : nullptr;
+  }
+
+  bool isBuiltin(std::string_view name) const {
+    auto *cmd = find(name);
+    return cmd && cmd->isBuiltin();
+  }
+
+private:
+  std::unordered_map<std::string, std::unique_ptr<ICommand>> commands_;
+};
+
+class ExitCommand : public ICommand {
+public:
+  std::string_view name() const override { return "exit"; }
+  bool isBuiltin() const override { return true; }
+  bool execute(std::span<const std::string>) override { return false; }
+};
+
+class EchoCommand : public ICommand {
+public:
+  std::string_view name() const override { return "echo"; }
+  bool isBuiltin() const override { return true; }
+  bool execute(std::span<const std::string> args) override {
     for (size_t i = 1; i < args.size(); ++i) {
       if (i > 1)
-        output += ' ';
-      output += args[i];
+        std::cout << ' ';
+      std::cout << args[i];
     }
-    return EchoCommandT{std::move(output)};
+    std::cout << '\n';
+    return true;
+  }
+};
+
+const char* getenvVar(const char* name) {
+  const char* envVarValue = getenv(name);
+  if (envVarValue != nullptr) {
+    return envVarValue;
   }
 
-  if (cmd == TypeCommandT::name) {
-    if (args.size() < 2)
-      return TypeCommandT{"type: missing argument"};
+  return nullptr;
+}
+
+class TypeCommand : public ICommand {
+public:
+  explicit TypeCommand(const CommandRegistry &registry) : registry_(registry) {}
+
+  std::string_view name() const override { return "type"; }
+  bool isBuiltin() const override { return true; }
+
+  bool execute(std::span<const std::string> args) override {
+    if (args.size() < 2) {
+      std::cout << "type: missing argument\n";
+      return true;
+    }
     const std::string &target = args[1];
-    bool isBuiltin = std::ranges::contains(BUILTIN_NAMES, target);
-    if (isBuiltin)
-      return TypeCommandT{target + " is a shell builtin"};
-    return TypeCommandT{target + ": not found"};
+    if (registry_.isBuiltin(target)) {
+      std::cout << target << " is a shell builtin\n";
+      return true;
+    }
+
+    if (const char *pathEnv = getenvVar("PATH")) {
+      std::istringstream ss(pathEnv);
+      std::string dir;
+      while (std::getline(ss, dir, ':')) {
+        auto fullPath = std::filesystem::path(dir) / target;
+        if (std::filesystem::is_regular_file(fullPath) &&
+            (std::filesystem::status(fullPath).permissions() &
+             std::filesystem::perms::owner_exec) != std::filesystem::perms::none) {
+          std::cout << target << " is " << fullPath.string() << "\n";
+          return true;
+        }
+      }
+    }
+
+
+    std::cout << target << ": not found\n";
+    return true;
+    
   }
 
-  return UnknownCommandT{cmd + ": command not found"};
-}
+private:
+  const CommandRegistry &registry_;
+};
 
-void print(const EvaluateReturnT &result) {
-  std::visit(
-      [](auto &&state) {
-        using T = std::decay_t<decltype(state)>;
-        if constexpr (std::is_same_v<T, UnknownCommandT>) {
-          std::cout << state.reason << '\n';
-        } else if constexpr (std::is_same_v<T, EchoCommandT>) {
-          std::cout << state.output << '\n';
-        } else if constexpr (std::is_same_v<T, TypeCommandT>) {
-          std::cout << state.output << '\n';
-        }
-      },
-      result);
-}
+
 
 } // namespace REPL
 
 int main() {
   std::cout << std::unitbuf;
   std::cerr << std::unitbuf;
+
+  REPL::CommandRegistry registry;
+  registry.registerCommand(std::make_unique<REPL::ExitCommand>());
+  registry.registerCommand(std::make_unique<REPL::EchoCommand>());
+  registry.registerCommand(std::make_unique<REPL::TypeCommand>(registry));
 
   while (true) {
     auto readResult = REPL::read();
@@ -124,12 +164,13 @@ int main() {
       break;
 
     auto &args = std::get<REPL::ReadSuccessCode>(readResult).args;
-    auto evalResult = REPL::evaluate(args);
 
-    if (std::holds_alternative<REPL::ExitCommandT>(evalResult))
-      break;
-
-    REPL::print(evalResult);
+    if (auto *cmd = registry.find(args[0])) {
+      if (!cmd->execute(args))
+        break;
+    } else {
+      std::cout << args[0] << ": command not found\n";
+    }
   }
 
   return 0;
